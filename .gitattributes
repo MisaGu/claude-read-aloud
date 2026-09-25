@@ -1,0 +1,2 @@
+# The launcher runs under sh; CRLF endings would break it on Windows checkouts.
+*.sh text eol=lf
