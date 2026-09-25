@@ -186,7 +186,9 @@ the installed Claude Code extension* on your machine:
   `connect-src http://127.0.0.1:48777`, so the button can reach this
   extension's local server. That is a real, if small, widening of the webview
   sandbox — one localhost port — and it's the entire reason this is opt-in
-  rather than default.
+  rather than default. The server answers only requests from a VS Code webview
+  (checked by `Origin` and `Host`), so a web page open in your browser cannot
+  use it to make your machine speak.
 
 Originals are backed up beside each file (`*.cra-orig`) and restored exactly on
 removal. **Every Claude Code update wipes the patch**; the extension notices on
@@ -207,6 +209,29 @@ voice to a feature request on
   exact path — never a guess).
 - The VS Code button scopes to the window's workspace, so a busier session in
   another project can't hijack what gets read.
+
+## Privacy and security
+
+- **What leaves your machine:** nothing with the `system` and `kokoro`
+  providers. With `speechify`, `elevenlabs` or `openai`, the text of each
+  reply is sent to that company to be voiced; `--status` says so.
+- **Reply text is treated as data, never as code.** A reply can carry text
+  that Claude picked up from a web page or a file, so it is never pasted into
+  a command line. On Windows the system voice receives it through an
+  environment variable. A `command` engine receives `{text}` as a single
+  argument with no shell, and `.bat`/`.cmd` engines are refused on Windows,
+  because cmd.exe would re-parse the reply.
+- **Stop kills only the reader it started.** The pidfile records the reader's
+  start time next to its pid, so a crash that leaves a stale pidfile cannot
+  make Stop kill an unrelated program that reused the pid. On Windows, Stop
+  ends the player too.
+- **Kokoro setup is pinned:** exact package versions installed from wheels
+  only, and SHA-256-checked model files.
+- **API keys:** prefer environment variables. Keys kept under `api_keys` in the
+  config file are plain text; `--status` warns about them, and on macOS and
+  Linux the file is saved owner-only.
+
+Tests: `python -m unittest discover -s tests`
 
 ## License
 

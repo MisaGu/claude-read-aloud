@@ -10,7 +10,7 @@ const os = require('os');
 // spawn processes. This extension therefore hosts a tiny localhost server.
 // The port is fixed because the patched CSP names it literally.
 const PORT = 48777;
-const MARKER = 'claude-read-aloud composer v2';
+const MARKER = 'claude-read-aloud composer v3';
 // The one place that says whether a reading is in progress. speak.py claims
 // this file when a run starts and drops it when the audio ends — whichever
 // entry point started it: this button, the hotkey, a slash command, the hook.
@@ -105,6 +105,7 @@ function isPlaying() {
   // seconds of a run go on loading a voice, and a click lands in them.
   if (child && child.exitCode === null && !child.killed) return true;
   try {
+    // "pid starttime": parseInt reads the pid. Liveness only; this never kills.
     const pid = parseInt(fs.readFileSync(PIDFILE, 'utf8').trim(), 10);
     if (!pid) return false;
     process.kill(pid, 0);                 // signal 0 only asks: still alive?
@@ -112,17 +113,26 @@ function isPlaying() {
   } catch { return false; }               // no file, or it died mid-reading
 }
 
+function killTree(p) {
+  // On Windows kill() is TerminateProcess: the reader's SIGTERM handler never
+  // runs, and the player it spawned would talk on. Take the whole tree down.
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/PID', String(p.pid), '/T', '/F'], { windowsHide: true });
+  } else {
+    p.kill('SIGTERM');
+  }
+}
+
 function stopNow() {
   // Kill our own reader by handle, not through the pidfile: a reader still
   // starting up has not claimed the file yet, and a stop that only reads the
   // file would miss it and leave two voices running over each other.
-  if (child && child.exitCode === null) { try { child.kill('SIGTERM'); } catch { /* gone */ } }
+  // A reader someone else started (the hook, a slash command) is stopped by
+  // speak.py itself: by the next reader's claim(), or by stop() below. Only
+  // speak.py checks that the pid in the file is still that reader and not an
+  // unrelated process that inherited the number after a crash.
+  if (child && child.exitCode === null) { try { killTree(child); } catch { /* gone */ } }
   child = null;
-  try {
-    const pid = parseInt(fs.readFileSync(PIDFILE, 'utf8').trim(), 10);
-    if (pid) process.kill(pid, 'SIGTERM');
-    fs.unlinkSync(PIDFILE);
-  } catch { /* nothing was reading */ }
 }
 
 function projectArgs() {
@@ -157,6 +167,7 @@ function speakText(text) {
 
 function stop() {
   stopNow();
+  run(['--stop']);
   setPlaying(false);
 }
 
@@ -220,14 +231,29 @@ function speakSelection() {
 function ensureServer() {
   if (server) return;
   server = http.createServer((req, res) => {
+    // Only Claude Code's own webview may drive this server. A browser lets any
+    // web page send requests to 127.0.0.1, and a CORS header only decides
+    // whether the page may READ the answer, not whether the request runs. So
+    // the server itself turns away every request that does not come from a
+    // VS Code webview. The Host check also defeats DNS rebinding, where a
+    // hostile domain re-points itself at 127.0.0.1 to look same-origin.
+    const origin = req.headers.origin || '';
+    const trusted = origin.startsWith('vscode-webview://') &&
+      req.headers.host === `127.0.0.1:${PORT}`;
+    if (!trusted) { res.writeHead(403); res.end(); req.resume(); return; }
     const cors = {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
+      'Vary': 'Origin',
     };
     if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
 
     const route = (req.url || '').split('?')[0];
+    // Anything that acts is POST; GET is only for reading /status.
+    if (req.method !== 'POST' && route !== '/status') {
+      res.writeHead(405, cors); res.end(); req.resume(); return;
+    }
     const body = [];
     let size = 0;
     req.on('data', c => { size += c.length; if (size <= 60_000) body.push(c); });
@@ -238,10 +264,10 @@ function ensureServer() {
         res.end(JSON.stringify({ playing: isPlaying() }));
         return;
       }
-      if (route === '/speak' && req.method === 'POST' && text) speakText(text);
+      if (route === '/speak' && text) speakText(text);
       else if (route === '/speak') speakTranscript();
       else if (route === '/stop') stop();
-      else if (route === '/selection' && req.method === 'POST') {
+      else if (route === '/selection') {
         selection = { text, at: Date.now() };
       } else if (route === '/speak-selection') {
         if (selection.text && Date.now() - selection.at < 60_000) speakText(selection.text);

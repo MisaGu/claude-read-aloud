@@ -109,6 +109,10 @@ def save_config(cfg: dict) -> None:
     p = config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    if not IS_WIN:
+        # It may hold API keys (api_keys): owner-only, like ~/.netrc. On
+        # Windows %APPDATA% is already private to the user.
+        os.chmod(p, 0o600)
 
 
 def api_key(cfg: dict, provider: str) -> str:
@@ -274,6 +278,8 @@ def _which(*names: str) -> str | None:
 # combined with DETACHED_PROCESS, so it must replace that flag, not join it.
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
+# A Windows environment variable holds at most 32,767 characters.
+WIN_ENV_MAX = 32000
 
 
 def quiet_win() -> dict:
@@ -281,21 +287,64 @@ def quiet_win() -> dict:
     return {"creationflags": CREATE_NO_WINDOW} if IS_WIN else {}
 
 
-def player_cmd(wav: pathlib.Path) -> list[str]:
+def powershell(script: str, **values: str) -> tuple[list[str], dict]:
+    """A PowerShell command whose inputs arrive as DATA, never as code.
+
+    Each value is handed over in an environment variable ($env:CRA_<NAME>) and
+    the script only ever reads it from there. Splicing text into the -Command
+    string instead means quoting it for PowerShell, and doubling ' is not
+    enough: PowerShell also closes a single-quoted string on the typographic
+    quotes ‘ ’ ‚ ‛, which Claude's replies are full of. One ’ in a reply
+    ended the string and ran whatever followed as a command.
+    """
+    env = dict(os.environ)
+    for name, value in values.items():
+        env[f"CRA_{name.upper()}"] = value
+    return ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], env
+
+
+def player_cmd(wav: pathlib.Path) -> tuple[list[str], dict | None]:
+    """Command (and environment, or None to inherit) that plays one WAV file."""
     if IS_MAC:
-        return ["afplay", str(wav)]
+        return ["afplay", str(wav)], None
     if IS_WIN:
-        path = str(wav).replace("'", "''")
-        return ["powershell", "-NoProfile", "-Command",
-                f"(New-Object Media.SoundPlayer '{path}').PlaySync()"]
+        return powershell("(New-Object Media.SoundPlayer $env:CRA_WAV).PlaySync()",
+                          wav=str(wav))
     p = _which("aplay", "paplay", "ffplay")
     if not p:
         sys.exit("no audio player found (need aplay, paplay, or ffplay)")
     if p == "ffplay":
-        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(wav)]
-    return [p, "-q", str(wav)] if p == "aplay" else [p, str(wav)]
+        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(wav)], None
+    return ([p, "-q", str(wav)] if p == "aplay" else [p, str(wav)]), None
 
 # ---------------------------------------------------------------------- providers
+
+
+def not_an_option(text: str) -> str:
+    """A reply starting with "-" would be parsed as an option (say -o FILE…);
+    a leading space keeps it an operand and is not heard."""
+    return " " + text if text.startswith("-") else text
+
+
+def command_argv(template: str, text: str = "", out: str = "") -> list[str]:
+    """argv for the custom "command" engine, {text} and {out} filled in.
+
+    Each placeholder lands inside one argv entry and no shell is involved, so
+    the reply cannot add arguments or commands, with one exception: on Windows
+    a .bat/.cmd program is run through cmd.exe, which re-parses the whole line,
+    and a reply containing & or | would run commands. Those are refused.
+    """
+    argv = shlex.split(template)
+    if not argv:
+        sys.exit(f'provider "command" has an empty command template in {config_path()}')
+    prog = pathlib.PureWindowsPath(argv[0])
+    if IS_WIN and (prog.suffix.lower() in (".bat", ".cmd")
+                   or prog.name.lower() in ("cmd", "cmd.exe")):
+        sys.exit("a .bat/.cmd file cannot be the command engine on Windows: cmd.exe "
+                 "would run parts of the reply as commands. Point \"command\" at "
+                 "the real program (an .exe, or python with a script).")
+    text = not_an_option(text)
+    return [a.replace("{text}", text).replace("{out}", out) for a in argv]
 
 
 def http_json(url: str, payload: dict, headers: dict) -> bytes:
@@ -381,13 +430,13 @@ def make_synth(cfg: dict):
         template = cfg["command"]
         if not template:
             sys.exit(f'provider "command" needs a command template in {config_path()}')
+        command_argv(template)                   # reject an unsafe template up front
         if "{out}" not in template:
             return None                          # self-playing command
 
         def synth(text: str, out: pathlib.Path) -> None:
-            cmd = [a.replace("{text}", text).replace("{out}", str(out))
-                   for a in shlex.split(template)]
-            subprocess.run(cmd, capture_output=True, check=True)
+            subprocess.run(command_argv(template, text=text, out=str(out)),
+                           capture_output=True, check=True)
         return synth
 
     return None                                  # system voices speak directly
@@ -396,23 +445,24 @@ def make_synth(cfg: dict):
 def speak_direct(text: str, cfg: dict) -> None:
     """System TTS (and self-playing custom commands): no files, near-zero latency."""
     speed = float(cfg["speed"] or 1.0)
+    env = None
     if cfg["provider"] == "command":
-        cmd = [a.replace("{text}", text) for a in shlex.split(cfg["command"])]
+        cmd = command_argv(cfg["command"], text=text)
     elif IS_MAC:
         cmd = ["say"]
         if cfg["voice"]:
             cmd += ["-v", cfg["voice"]]
         if abs(speed - 1.0) > 0.01:
             cmd += ["-r", str(int(190 * speed))]
-        cmd.append(text)
+        cmd.append(not_an_option(text))
     elif IS_WIN:
-        esc = text.replace("'", "''")
         rate = max(-10, min(10, int((speed - 1.0) * 10)))
-        sel = (f"$s.SelectVoice('{cfg['voice']}');" if cfg["voice"] else "")
-        cmd = ["powershell", "-NoProfile", "-Command",
-               "Add-Type -AssemblyName System.Speech;"
-               "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
-               f"{sel}$s.Rate = {rate};$s.Speak('{esc}')"]
+        cmd, env = powershell(
+            "Add-Type -AssemblyName System.Speech;"
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+            "if ($env:CRA_VOICE) { $s.SelectVoice($env:CRA_VOICE) };"
+            f"$s.Rate = {rate};$s.Speak($env:CRA_TEXT)",
+            text=text[:WIN_ENV_MAX], voice=str(cfg["voice"] or ""))
     else:
         if not _which("spd-say"):
             sys.exit("no system voice found — install speech-dispatcher, "
@@ -422,14 +472,16 @@ def speak_direct(text: str, cfg: dict) -> None:
             cmd += ["-y", cfg["voice"]]
         if abs(speed - 1.0) > 0.01:
             cmd += ["-r", str(max(-100, min(100, int((speed - 1.0) * 100))))]
-        cmd.append(text)
+        cmd.append(not_an_option(text))
 
     global _player
     claim()
-    _player = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, **quiet_win())
-    _player.wait()
-    release()
+    try:
+        _player = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, env=env,
+                                   stderr=subprocess.DEVNULL, **quiet_win())
+        _player.wait()
+    finally:
+        release()
 
 # ------------------------------------------------------------------ kokoro (local)
 
@@ -443,6 +495,26 @@ KOKORO_URLS = {
         "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
         "model-files-v1.0/voices-v1.0.bin",
 }
+# SHA-256 of each release file. The model is loaded and run by the runner, so
+# a file swapped on the server (or in transit) must be refused, not used.
+KOKORO_SHA256 = {
+    "kokoro-v1.0.onnx":
+        "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5",
+    "voices-v1.0.bin":
+        "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d",
+}
+# Exact versions, wheels only: an unpinned install takes whatever is newest on
+# PyPI the day it runs, and a source build runs the package's own setup code.
+KOKORO_PACKAGES = ["kokoro-onnx==0.5.0", "soundfile==0.14.0"]
+
+
+def sha256_of(path: pathlib.Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for buf in iter(lambda: f.read(1 << 20), b""):
+            h.update(buf)
+    return h.hexdigest()
 
 # Written to disk at setup; runs inside the plugin's own venv where
 # kokoro-onnx and soundfile exist. The plugin itself stays stdlib-only.
@@ -477,17 +549,21 @@ def setup_kokoro() -> int:
     vp, model, voices_bin, runner = kokoro_paths()
 
     if not vp.exists():
+        if not (3, 10) <= sys.version_info[:2] <= (3, 13):
+            sys.exit(f"kokoro-onnx needs Python 3.10–3.13, and this is "
+                     f"{sys.version.split()[0]}. Run this setup with one of those, "
+                     f"e.g.  py -3.12 speak.py --setup kokoro")
         print("creating a private virtualenv…", flush=True)
         subprocess.run([sys.executable, "-m", "venv", str(d / "venv")], check=True)
     print("installing kokoro-onnx (a few minutes on first run)…", flush=True)
-    subprocess.run([str(vp), "-m", "pip", "install", "--quiet", "--upgrade",
-                    "kokoro-onnx", "soundfile"], check=True)
+    subprocess.run([str(vp), "-m", "pip", "install", "--quiet", "--only-binary=:all:",
+                    *KOKORO_PACKAGES], check=True)
 
     (d / "kokoro").mkdir(exist_ok=True)
-    for name, min_mb in (("kokoro-v1.0.onnx", 200), ("voices-v1.0.bin", 10)):
+    for name in ("kokoro-v1.0.onnx", "voices-v1.0.bin"):
         dest = d / "kokoro" / name
-        if dest.exists() and dest.stat().st_size > min_mb * 1_000_000:
-            print(f"{name}: already present", flush=True)
+        if dest.exists() and sha256_of(dest) == KOKORO_SHA256[name]:
+            print(f"{name}: already present, checksum ok", flush=True)
             continue
         print(f"downloading {name}…", flush=True)
         tmp = dest.with_suffix(".part")
@@ -503,7 +579,12 @@ def setup_kokoro() -> int:
                 got += len(buf)
                 if total and got % (50 << 20) < (1 << 20):
                     print(f"  {got >> 20} / {total >> 20} MB", flush=True)
-        tmp.rename(dest)
+        digest = sha256_of(tmp)
+        if digest != KOKORO_SHA256[name]:
+            tmp.unlink(missing_ok=True)
+            sys.exit(f"{name}: checksum mismatch, refusing to use it "
+                     f"(expected {KOKORO_SHA256[name]}, got {digest})")
+        tmp.replace(dest)
         print(f"  {name}: {dest.stat().st_size >> 20} MB", flush=True)
 
     runner.write_text(KOKORO_RUNNER, encoding="utf-8")
@@ -528,21 +609,87 @@ def setup_kokoro() -> int:
 _player: subprocess.Popen | None = None
 
 
-def stop() -> None:
-    """Stop whoever holds the reading. Never this process — see claim()."""
-    if not PIDFILE.exists():
-        return
+def process_start(pid: int) -> str | None:
+    """When process `pid` started, as an opaque string; None if it is not running.
+
+    A pid alone does not name a process: once a reader crashes without
+    releasing the pidfile, the operating system hands its number to the next
+    process that starts (Windows does so within seconds), and "stop the
+    reading" would then kill that one: an editor, a browser, anything. The
+    pidfile therefore records the start time too, and stop() kills only when
+    both still match.
+    """
     try:
-        pid = int(PIDFILE.read_text().strip())
-    except (OSError, ValueError):
-        PIDFILE.unlink(missing_ok=True)
-        return
-    if pid == os.getpid():
+        if IS_WIN:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + \
+                [ctypes.POINTER(wintypes.FILETIME)] * 4
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = k32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                code = wintypes.DWORD()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)) \
+                        or code.value != 259:                # STILL_ACTIVE
+                    return None
+                times = [wintypes.FILETIME() for _ in range(4)]
+                if not k32.GetProcessTimes(handle, *map(ctypes.byref, times)):
+                    return None
+                return str(times[0].dwHighDateTime << 32 | times[0].dwLowDateTime)
+            finally:
+                k32.CloseHandle(handle)
+        stat = pathlib.Path(f"/proc/{pid}/stat")
+        if stat.exists():                        # Linux: field 22, after "(comm)"
+            return stat.read_text().rsplit(")", 1)[1].split()[19]
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout.strip()
+        return out or None
+    except (OSError, IndexError, AttributeError):
+        return None
+
+
+def kill_reader(pid: int) -> None:
+    """End a reader and everything it started.
+
+    On Windows os.kill() is TerminateProcess: the reader's SIGTERM handler
+    never runs, so the player it spawned would talk on. Kill the whole tree.
+    """
+    if IS_WIN:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, **quiet_win())
         return
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
-        pass                                     # already gone, or not ours
+        pass                                     # already gone
+
+
+def read_pidfile() -> tuple[int, str] | None:
+    """(pid, start time) of the recorded reader, or None when there is none."""
+    try:
+        pid, _, start = PIDFILE.read_text().strip().partition(" ")
+        return int(pid), start
+    except (OSError, ValueError):
+        return None
+
+
+def stop() -> None:
+    """Stop whoever holds the reading. Never this process — see claim()."""
+    if not PIDFILE.exists():
+        return
+    rec = read_pidfile()
+    if rec and rec[0] == os.getpid():
+        return
+    # A record without a start time comes from an older version; it cannot be
+    # verified, so it is dropped rather than trusted.
+    if rec and rec[1] and process_start(rec[0]) == rec[1]:
+        kill_reader(rec[0])
     PIDFILE.unlink(missing_ok=True)
 
 
@@ -555,18 +702,16 @@ def claim() -> None:
     leave two voices talking over each other.
     """
     stop()
-    PIDFILE.write_text(str(os.getpid()))
+    PIDFILE.write_text(f"{os.getpid()} {process_start(os.getpid()) or ''}".strip())
     signal.signal(signal.SIGTERM, _on_term)
     _sweep_parts()
 
 
 def release() -> None:
     """Hand back the pidfile if it is still ours, and take our audio with us."""
-    try:
-        if PIDFILE.read_text().strip() == str(os.getpid()):
-            PIDFILE.unlink(missing_ok=True)
-    except (OSError, ValueError):
-        pass
+    rec = read_pidfile()
+    if rec and rec[0] == os.getpid():
+        PIDFILE.unlink(missing_ok=True)
     for part in PARTS:
         try:
             part.unlink(missing_ok=True)
@@ -598,23 +743,24 @@ def play_chunked(text: str, cfg: dict, synth) -> None:
     """Gapless chunked playback: synthesise chunk i+1 while chunk i plays."""
     global _player
     claim()                                      # never overlap two readings
-
-    chunks = chunk_text(text, int(cfg["first_chars"]), int(cfg["chunk_chars"]))
-    synth(chunks[0], PARTS[0])
-    for i in range(len(chunks)):
-        cur = PARTS[i % 2]
-        _player = subprocess.Popen(
-            player_cmd(cur), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            **quiet_win())
-        prefetch = None
-        if i + 1 < len(chunks):
-            prefetch = threading.Thread(
-                target=synth, args=(chunks[i + 1], PARTS[(i + 1) % 2]), daemon=True)
-            prefetch.start()
-        _player.wait()
-        if prefetch:
-            prefetch.join()
-    release()
+    try:
+        chunks = chunk_text(text, int(cfg["first_chars"]), int(cfg["chunk_chars"]))
+        synth(chunks[0], PARTS[0])
+        for i in range(len(chunks)):
+            cmd, env = player_cmd(PARTS[i % 2])
+            _player = subprocess.Popen(
+                cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **quiet_win())
+            prefetch = None
+            if i + 1 < len(chunks):
+                prefetch = threading.Thread(
+                    target=synth, args=(chunks[i + 1], PARTS[(i + 1) % 2]), daemon=True)
+                prefetch.start()
+            _player.wait()
+            if prefetch:
+                prefetch.join()
+    finally:
+        release()                                # a failed request must not strand it
 
 # --------------------------------------------------------------------------- modes
 
@@ -779,6 +925,13 @@ def show_status(cfg: dict) -> None:
     print(f"speed     : {cfg['speed']}")
     print(f"auto_read : {'on — every reply is spoken' if cfg['auto_read'] else 'off'}")
     print(f"api keys  : " + "  ".join(f"{p}:{s}" for p, s in keys.items()))
+    if "config" in keys.values():
+        print("warning   : API keys are stored in plain text in the config file. "
+              "Prefer environment variables (e.g. OPENAI_API_KEY) and remove "
+              "them from api_keys.")
+    if cfg["provider"] in ("speechify", "elevenlabs", "openai"):
+        print(f"privacy   : replies are sent to {cfg['provider']} to be voiced. "
+              f"The system and kokoro providers never leave this machine.")
 
 
 def main() -> int:
@@ -900,11 +1053,14 @@ def main() -> int:
     # Claimed before the engine is built, not after: loading a 300MB model or
     # waiting on a cloud voice is exactly the window a second click lands in.
     claim()
-    synth = make_synth(cfg)
-    if synth is None:
-        speak_direct(text, cfg)
-    else:
-        play_chunked(text, cfg, synth)
+    try:
+        synth = make_synth(cfg)
+        if synth is None:
+            speak_direct(text, cfg)
+        else:
+            play_chunked(text, cfg, synth)
+    finally:
+        release()                                # e.g. a missing API key exits here
     return 0
 
 
