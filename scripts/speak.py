@@ -2,16 +2,20 @@
 """Read Claude's replies aloud. Python 3.9+, standard library only.
 
   speak.py                      speak the last reply (newest transcript)
+  speak.py --session ID         …of one session (Claude Code's session id)
   speak.py --project PATH       …scoped to one workspace's sessions
   speak.py --transcript FILE    …from one specific session transcript
+  speak.py --previous           …the reply before the latest prompt
   speak.py --text "…"           speak the given text
   speak.py --stdin              speak the text arriving on stdin
   speak.py --stop               stop playback
   speak.py --detach             re-launch detached, return immediately
-  speak.py --hook               Stop-hook mode: exit fast unless auto_read is on
+  speak.py --turn ID            run as part of a slash-command turn in session ID
+  speak.py --hook               Stop / UserPromptSubmit hook mode
   speak.py --status             show current configuration
   speak.py --auto on|off        toggle read-every-reply
-  speak.py --print              show what would be spoken, speak nothing
+  speak.py --set-voice V [--lang ru|en]   default voice, or one per language
+  speak.py --print              show what would be spoken (and by which voice)
 
 Design notes, learned the hard way before this was a plugin:
 
@@ -27,9 +31,13 @@ Design notes, learned the hard way before this was a plugin:
 * SPEECHIFY'S WAV NEEDS ITS HEADER FIXED. It arrives with the RIFF/data sizes
   set to 0xFFFFFFFF (a streaming placeholder); some players then play the
   header bytes as audio — it sounds like a burst of static.
-* HOOK MODE MUST BE HARMLESS. It reads the exact transcript path from stdin
-  (never guesses), spawns itself detached, and exits 0 no matter what —
-  a TTS failure must never break Claude's own flow.
+* HOOK MODE MUST BE HARMLESS. It takes the reply text Claude Code hands the
+  Stop hook (never guesses), spawns itself detached, and exits 0 no matter
+  what — a TTS failure must never break Claude's own flow.
+* ONE VOICE PER LANGUAGE. A reply that mixes Russian and English is split
+  into runs by alphabet, and each run is read by a voice of its language.
+* FAILURES ARE WRITTEN DOWN. A detached reading has no terminal; what goes
+  wrong lands in read-aloud.log, and --status / --detach report it.
 """
 from __future__ import annotations
 
@@ -60,7 +68,10 @@ PIDFILE = pathlib.Path(tempfile.gettempdir()) / "claude-read-aloud.pid"
 # a file the new one is rewriting. That is heard as garble, not as a handover.
 PARTS = [pathlib.Path(tempfile.gettempdir()) / f"claude-read-aloud-{os.getpid()}-{i}.wav"
          for i in (0, 1)]
-PART_GLOB = "claude-read-aloud-*-[01].wav"
+# What the Windows system voice is asked to read, one file per reader.
+JOB = pathlib.Path(tempfile.gettempdir()) / f"claude-read-aloud-{os.getpid()}-job.json"
+SCRATCH_GLOBS = ("claude-read-aloud-*-[01].wav", "claude-read-aloud-*-job.json",
+                 "claude-read-aloud-handoff-*", "claude-read-aloud-quiet-*")
 
 IS_MAC = sys.platform == "darwin"
 IS_WIN = os.name == "nt"
@@ -82,9 +93,40 @@ def data_dir() -> pathlib.Path:
     return base / "claude-read-aloud"
 
 
+def log_path() -> pathlib.Path:
+    return data_dir() / "read-aloud.log"
+
+
+def log(msg: str) -> None:
+    """Record a failure where --status and --detach can find it. Never raises."""
+    try:
+        p = log_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > 256_000:     # keep it small
+            p.write_bytes(p.read_bytes()[-64_000:])
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def last_error() -> tuple[str, float] | None:
+    """(last line of the log, its age in seconds), or None."""
+    try:
+        p = log_path()
+        lines = [ln for ln in p.read_text(encoding="utf-8", errors="replace").splitlines()
+                 if ln.strip()]
+        return (lines[-1], time.time() - p.stat().st_mtime) if lines else None
+    except OSError:
+        return None
+
+
 DEFAULTS = {
     "provider": "system",   # system | speechify | elevenlabs | openai | command
     "voice": "",            # provider-specific voice name/id; "" = default
+    "voices": {},           # system voice per language, e.g. {"ru": "Microsoft Irina
+                            # Desktop"}; unset languages pick an installed voice
+    "stop_on_prompt": True,  # sending a new prompt stops that session's reading
     "speed": 1.0,
     "auto_read": False,     # Stop hook reads every reply when true
     "max_chars": 12000,     # hard cap; ~14 minutes of speech
@@ -126,26 +168,68 @@ def api_key(cfg: dict, provider: str) -> str:
 # ----------------------------------------------------------------- transcript → text
 
 
-def newest_transcript(project: str | None = None) -> pathlib.Path | None:
-    """Newest session transcript, scoped to one project when a path is given.
+def valid_session(value) -> str:
+    """A Claude Code session id, or "" for anything that does not look like one
+    (it becomes part of file names and glob patterns)."""
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) \
+        else ""
 
-    Claude Code encodes a project path into its directory name by replacing
-    every non-alphanumeric character with '-'. Unscoped "newest across all
-    projects" reads whichever session wrote last — the wrong one whenever two
-    sessions are running, which is why scoping exists.
+
+def project_dir_name(project: str) -> str:
+    """The ~/.claude/projects folder Claude Code keeps a project's sessions in.
+
+    Claude Code replaces every non-alphanumeric character of the path with '-':
+    /home/me/app → -home-me-app, C:\\Users\\me\\app → C--Users-me-app. A Git
+    Bash path (/c/Users/me/app) names the same Windows folder, so it is turned
+    back into C:/Users/me/app first.
     """
-    files: list[pathlib.Path] = []
+    m = re.match(r"^/([A-Za-z])(/.*)?$", project) if IS_WIN else None
+    if m:
+        project = f"{m.group(1).upper()}:{m.group(2) or '/'}"
+    return re.sub(r"[^A-Za-z0-9]", "-", project.rstrip("/\\"))
+
+
+def find_transcript(session: str = "", project: str | None = None) -> pathlib.Path | None:
+    """The transcript to read: the session's own when its id is known, else the
+    newest in the project, else the newest anywhere.
+
+    Newest-anywhere is a last resort: it reads whichever session wrote last,
+    the wrong one whenever two are running.
+    """
+    newest = lambda files: max(files, key=lambda p: p.stat().st_mtime) if files else None
+    if session:
+        found = newest(list(PROJECTS.glob(f"*/{session}.jsonl")))
+        if found:
+            return found
     if project:
-        enc = "-" + re.sub(r"[^A-Za-z0-9]", "-", project.strip("/\\"))
-        files = list((PROJECTS / enc).glob("*.jsonl"))
-    if not files:
-        files = list(PROJECTS.glob("*/*.jsonl"))
-    return max(files, key=lambda p: p.stat().st_mtime) if files else None
+        found = newest(list((PROJECTS / project_dir_name(project)).glob("*.jsonl")))
+        if found:
+            return found
+    return newest(list(PROJECTS.glob("*/*.jsonl")))
 
 
-def last_reply(path: pathlib.Path) -> str:
-    """The final assistant text block in a session transcript."""
-    text = ""
+def is_prompt(e: dict) -> bool:
+    """A message the person sent (a slash command counts), as opposed to a tool
+    result or text Claude Code injected on its own (isMeta)."""
+    if e.get("type") != "user" or e.get("isMeta"):
+        return False
+    c = e.get("message", {}).get("content")
+    if isinstance(c, str):
+        return bool(c.strip())
+    if isinstance(c, list):
+        kinds = {b.get("type") for b in c if isinstance(b, dict)}
+        return "text" in kinds and "tool_result" not in kinds
+    return False
+
+
+def last_reply(path: pathlib.Path, previous: bool = False) -> str:
+    """The final assistant text in a session transcript.
+
+    previous=True: the reply as it stood when the latest prompt arrived. /speak
+    runs as a turn of its own, and whatever Claude says during that turn is not
+    what the person asked to hear.
+    """
+    text = answered = ""
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -157,6 +241,9 @@ def last_reply(path: pathlib.Path) -> str:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if previous and is_prompt(e):
+            answered = text
+            continue
         if e.get("type") != "assistant":
             continue
         blocks = e.get("message", {}).get("content", [])
@@ -166,27 +253,118 @@ def last_reply(path: pathlib.Path) -> str:
                          if isinstance(b, dict) and b.get("type") == "text")
         if joined.strip():
             text = joined
-    return text
+    return answered if previous else text
+
+# ------------------------------------------------------------- markdown → speech
+
+CYRILLIC = re.compile(r"[\u0400-\u04FF]")
+LATIN = re.compile(r"[A-Za-z\u00C0-\u024F]")
+# Pictographs, dingbats and their joiners: a voice reads 🔊 as "speaker high
+# volume". Arrows become a pause instead.
+EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u20E3]")
+TABLE_ROW = re.compile(r"^\s*\|(.*)\|\s*$")
+TABLE_RULE = re.compile(r"^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*(:?-{2,}:?\s*)?$")
+RULE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+
+PHRASES = {
+    "en": {"code": "code omitted", "link": "link",
+           "more": "… I'll stop there — the rest is on screen."},
+    "ru": {"code": "код пропущен", "link": "ссылка",
+           "more": "… На этом остановлюсь — остальное на экране."},
+}
+
+
+def text_lang(s: str) -> str | None:
+    """"ru" or "en" by which alphabet more words of s are in; None without words.
+
+    Two voices cover a Russian/English reply: Cyrillic goes to the Russian
+    voice, anything in Latin letters to the other. Russian technical prose is
+    full of English names ("Запусти npm install и затем npm run build"), while
+    English prose almost never holds two Russian words. So two Russian words
+    make a sentence Russian; otherwise the majority of words decides, a tie
+    going to Russian.
+    """
+    words = re.findall(r"[^\W\d_]+", s)
+    cyr = sum(1 for w in words if CYRILLIC.search(w))
+    lat = sum(1 for w in words if not CYRILLIC.search(w) and LATIN.search(w))
+    if not cyr and not lat:
+        return None
+    return "ru" if cyr >= 2 or cyr >= lat else "en"
+
+
+def code_words(code: str) -> str:
+    """Inline code as it should sound: speak_direct() → "speak direct"."""
+    return re.sub(r"\(\)", "", code).replace("_", " ")
 
 
 def spoken_form(md: str, max_chars: int) -> str:
-    """Markdown reads terribly aloud — strip everything that is not prose."""
-    s = re.sub(r"```.*?```", " (code omitted) ", md, flags=re.S)
-    s = re.sub(r"`([^`]*)`", r"\1", s)
-    s = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", s)
-    s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)      # keep link text, drop URL
-    s = re.sub(r"^\s*\|.*\|\s*$", " ", s, flags=re.M)   # tables
-    s = re.sub(r"^[ \t]*[-*+]\s+", "", s, flags=re.M)   # bullets
-    s = re.sub(r"^#{1,6}\s*", "", s, flags=re.M)        # headings
-    s = re.sub(r"[*_>#`]+", "", s)
-    s = re.sub(r"https?://\S+", " link ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    """Markdown reads terribly aloud: keep the prose, say what was left out.
+
+    Every line ends in punctuation, so headings, list items and table rows
+    get a pause instead of running into the next line.
+    """
+    lang = text_lang(re.sub(r"```.*?(```|\Z)", "", md, flags=re.S)) or "en"
+    say = PHRASES[lang]
+    s = md.replace("\r\n", "\n")
+    # Fenced code, including a fence the reply left open.
+    s = re.sub(r"^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]*\1[ \t]*$|\Z)",
+               f"\n{say['code']}.\n", s, flags=re.S | re.M)
+    s = re.sub(r"```.*?```", f" {say['code']} ", s, flags=re.S)
+    s = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", s)                   # images
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)                # links: keep the words
+    s = re.sub(r"<https?://[^>\s]+>", f" {say['link']} ", s)
+    s = re.sub(r"https?://[^\s)>\]]+", f" {say['link']} ", s)
+    s = re.sub(r"</?[A-Za-z][^>\n]*>", " ", s)                    # HTML tags
+    s = re.sub(r"`([^`\n]+)`", lambda m: code_words(m.group(1)), s)
+    s = re.sub(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", r"\2", s)        # bold
+    s = re.sub(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=\S)\*(?![\w*])", r"\1", s)
+    s = re.sub(r"(?<!\w)_(?=[^\s_])([^_\n]+?)(?<=\S)_(?!\w)", r"\1", s)
+    s = re.sub(r"~~(.+?)~~", r"\1", s)
+    s = re.sub(r"(?<=\w)_(?=\w)", " ", s)                         # snake_case
+    s = EMOJI.sub("", s)
+    s = re.sub(r"\s*[→⇒⟶]\s*", " — ", s)
+
+    lines = []
+    for line in s.split("\n"):
+        if TABLE_RULE.match(line) or RULE.match(line):
+            continue
+        row = TABLE_ROW.match(line)
+        if row:                                                   # a row is a sentence
+            line = ", ".join(c.strip() for c in row.group(1).split("|") if c.strip())
+        line = re.sub(r"^\s*#{1,6}\s+", "", line)                 # heading
+        line = re.sub(r"^\s*(>\s*)+", "", line)                   # quote
+        line = re.sub(r"^\s*[-*+]\s+(\[[ xX]\]\s+)?", "", line)   # bullet, task box
+        line = line.strip()
+        if line:
+            lines.append(line if line[-1] in ".!?…:;," else line + ".")
+    s = re.sub(r"\s+", " ", " ".join(lines)).strip()
     if len(s) > max_chars:
         cut = s[:max_chars]
         end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
-        s = (cut[:end + 1] if end > max_chars // 2 else cut) \
-            + " … I'll stop there — the rest is on screen."
+        s = (cut[:end + 1] if end > max_chars // 2 else cut) + " " + say["more"]
     return s
+
+
+def segments(text: str) -> list[tuple[str, str]]:
+    """Split spoken text into runs of one language: [("ru", "…"), ("en", "…")].
+
+    A sentence without letters ("2.", "—") joins its neighbour's run. A
+    period followed by a lowercase word is an abbreviation ("см. файл",
+    "e.g. this"), not the end of a sentence.
+    """
+    sents = [x for x in re.split(r"(?<=[.!?;:…]) +(?![a-zа-яё])", text) if x.strip()]
+    langs = [text_lang(x) for x in sents]
+    known = [l for l in langs if l]
+    last = known[0] if known else "en"
+    runs: list[list[str]] = []
+    for sent, lang in zip(sents, langs):
+        lang = lang or last
+        last = lang
+        if runs and runs[-1][0] == lang:
+            runs[-1][1] += " " + sent
+        else:
+            runs.append([lang, sent])
+    return [(lang, t) for lang, t in runs]
 
 # ------------------------------------------------------------------------ chunking
 
@@ -206,7 +384,7 @@ def chunk_text(s: str, first: int, full: int) -> list[str]:
     for sent in re.split(r"(?<=[.!?;:]) +", s):
         while len(sent) > limit:                # pathological unbroken run
             take = limit - len(cur) - 1 if cur else limit
-            if take < 40:                       # no room left in this chunk
+            if cur and take < 40:               # no room left in this chunk
                 parts.append(cur)
                 cur = ""
                 limit = next(gen)
@@ -278,8 +456,6 @@ def _which(*names: str) -> str | None:
 # combined with DETACHED_PROCESS, so it must replace that flag, not join it.
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
-# A Windows environment variable holds at most 32,767 characters.
-WIN_ENV_MAX = 32000
 
 
 def quiet_win() -> dict:
@@ -442,44 +618,118 @@ def make_synth(cfg: dict):
     return None                                  # system voices speak directly
 
 
+# One PowerShell process reads every run, switching voice per language.
+# Choice per run: the voice configured for that language (voices.ru), else
+# the default voice if it speaks the language, else the first installed voice
+# that does, else the default voice anyway. Text arrives through a UTF-8 job
+# file, never through the script. CRA_DRY prints the choice instead.
+WIN_SPEAK = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Speech
+$s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$s.Rate = {rate}
+$job = [IO.File]::ReadAllText($env:CRA_JOB, [Text.Encoding]::UTF8) | ConvertFrom-Json
+$all = @($s.GetInstalledVoices() | Where-Object { $_.Enabled } | ForEach-Object { $_.VoiceInfo })
+function Pick([string]$lang) {
+  $want = $job.voices.$lang
+  if ($want -and ($all | Where-Object { $_.Name -eq $want })) { return $want }
+  $mine = $all | Where-Object { $_.Name -eq $job.voice } | Select-Object -First 1
+  if ($mine -and $mine.Culture.TwoLetterISOLanguageName -eq $lang) { return $mine.Name }
+  $any = $all | Where-Object { $_.Culture.TwoLetterISOLanguageName -eq $lang } | Select-Object -First 1
+  if ($any) { return $any.Name }
+  if ($mine) { return $mine.Name }
+  return ''
+}
+if ($env:CRA_DRY) { [Console]::OutputEncoding = [Text.Encoding]::UTF8 }
+foreach ($seg in $job.segments) {
+  $name = Pick $seg.lang
+  if ($env:CRA_DRY) { [Console]::Out.WriteLine($name + "`t" + $seg.text); continue }
+  if ($name) { $s.SelectVoice($name) }
+  $s.Speak($seg.text)
+}
+"""
+
+_mac_voices: list[tuple[str, str]] | None = None
+
+
+def mac_voices() -> list[tuple[str, str]]:
+    """[(name, locale)] from `say -v ?`, read once per run."""
+    global _mac_voices
+    if _mac_voices is None:
+        out = subprocess.run(["say", "-v", "?"], capture_output=True, text=True).stdout
+        _mac_voices = [(m.group(1).strip(), m.group(2)) for m in
+                       (re.match(r"^(.*?)\s{2,}([a-z]{2}_\w+)", ln) for ln in out.splitlines())
+                       if m]
+    return _mac_voices
+
+
+def mac_voice_for(lang: str, cfg: dict) -> str:
+    """Same choice as on Windows (see WIN_SPEAK), from macOS's voices."""
+    want = (cfg.get("voices") or {}).get(lang)
+    if want:
+        return want
+    listed = mac_voices()
+    mine = next((loc for name, loc in listed if name == cfg["voice"]), None)
+    if mine and mine.startswith(lang):
+        return cfg["voice"]
+    return next((name for name, loc in listed if loc.startswith(lang + "_")),
+                cfg["voice"] or "")
+
+
+def system_speech(segs: list[tuple[str, str]], cfg: dict) -> list[tuple[list[str], dict | None]]:
+    """Commands that read segs aloud with the system voices, one voice per language.
+    Run them in order; each returns when its speech ends."""
+    speed = float(cfg["speed"] or 1.0)
+    if IS_WIN:
+        JOB.write_text(json.dumps({
+            "voice": str(cfg["voice"] or ""), "voices": cfg.get("voices") or {},
+            "segments": [{"lang": lang, "text": t} for lang, t in segs],
+        }, ensure_ascii=False), encoding="utf-8")
+        rate = max(-10, min(10, int((speed - 1.0) * 10)))
+        return [powershell(WIN_SPEAK.replace("{rate}", str(rate)), job=str(JOB))]
+    cmds = []
+    for lang, t in segs:
+        if IS_MAC:
+            cmd = ["say"]
+            voice = mac_voice_for(lang, cfg)
+            if voice:
+                cmd += ["-v", voice]
+            if abs(speed - 1.0) > 0.01:
+                cmd += ["-r", str(int(190 * speed))]
+        else:
+            if not _which("spd-say"):
+                sys.exit("no system voice found — install speech-dispatcher, "
+                         "or pick a cloud provider (see --status)")
+            cmd = ["spd-say", "-w", "-l", lang]
+            voice = (cfg.get("voices") or {}).get(lang) or (cfg["voice"] if lang == "en" else "")
+            if voice:
+                cmd += ["-y", voice]
+            if abs(speed - 1.0) > 0.01:
+                cmd += ["-r", str(max(-100, min(100, int((speed - 1.0) * 100))))]
+        cmds.append((cmd + [not_an_option(t)], None))
+    return cmds
+
+
+def run_players(cmds: list[tuple[list[str], dict | None]]) -> None:
+    """Run speaking/playing commands one after another. Their stderr is ours,
+    so in a detached reading it lands in the log."""
+    global _player
+    for cmd, env in cmds:
+        _player = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, **quiet_win())
+        code = _player.wait()
+        if code != 0:
+            raise RuntimeError(f"{pathlib.Path(cmd[0]).name} exited with code {code}")
+
+
 def speak_direct(text: str, cfg: dict) -> None:
     """System TTS (and self-playing custom commands): no files, near-zero latency."""
-    speed = float(cfg["speed"] or 1.0)
-    env = None
     if cfg["provider"] == "command":
-        cmd = command_argv(cfg["command"], text=text)
-    elif IS_MAC:
-        cmd = ["say"]
-        if cfg["voice"]:
-            cmd += ["-v", cfg["voice"]]
-        if abs(speed - 1.0) > 0.01:
-            cmd += ["-r", str(int(190 * speed))]
-        cmd.append(not_an_option(text))
-    elif IS_WIN:
-        rate = max(-10, min(10, int((speed - 1.0) * 10)))
-        cmd, env = powershell(
-            "Add-Type -AssemblyName System.Speech;"
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
-            "if ($env:CRA_VOICE) { $s.SelectVoice($env:CRA_VOICE) };"
-            f"$s.Rate = {rate};$s.Speak($env:CRA_TEXT)",
-            text=text[:WIN_ENV_MAX], voice=str(cfg["voice"] or ""))
+        cmds = [(command_argv(cfg["command"], text=text), None)]
     else:
-        if not _which("spd-say"):
-            sys.exit("no system voice found — install speech-dispatcher, "
-                     "or pick a cloud provider (see --status)")
-        cmd = ["spd-say", "-w"]
-        if cfg["voice"]:
-            cmd += ["-y", cfg["voice"]]
-        if abs(speed - 1.0) > 0.01:
-            cmd += ["-r", str(max(-100, min(100, int((speed - 1.0) * 100))))]
-        cmd.append(not_an_option(text))
-
-    global _player
+        cmds = system_speech(segments(text), cfg)
     claim()
     try:
-        _player = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, env=env,
-                                   stderr=subprocess.DEVNULL, **quiet_win())
-        _player.wait()
+        run_players(cmds)
     finally:
         release()
 
@@ -670,21 +920,36 @@ def kill_reader(pid: int) -> None:
         pass                                     # already gone
 
 
-def read_pidfile() -> tuple[int, str] | None:
-    """(pid, start time) of the recorded reader, or None when there is none."""
+# The session this reading belongs to ("" when started outside one, e.g. from
+# VS Code). A new prompt stops its own session's reading, no one else's.
+_session = ""
+
+
+def read_pidfile() -> tuple[int, str, str] | None:
+    """(pid, start time, session) of the recorded reader, or None.
+
+    The file reads "PID START SESSION", "-" standing for an empty field; an
+    older version wrote only "PID".
+    """
     try:
-        pid, _, start = PIDFILE.read_text().strip().partition(" ")
-        return int(pid), start
-    except (OSError, ValueError):
+        fields = PIDFILE.read_text().split()
+        fields = [("" if f == "-" else f) for f in fields] + ["", ""]
+        return int(fields[0]), fields[1], fields[2]
+    except (OSError, ValueError, IndexError):
         return None
 
 
-def stop() -> None:
-    """Stop whoever holds the reading. Never this process — see claim()."""
+def stop(only_session: str | None = None) -> None:
+    """Stop whoever holds the reading. Never this process — see claim().
+
+    only_session: stop it only if that session started it.
+    """
     if not PIDFILE.exists():
         return
     rec = read_pidfile()
     if rec and rec[0] == os.getpid():
+        return
+    if only_session is not None and (not rec or rec[2] != only_session):
         return
     # A record without a start time comes from an older version; it cannot be
     # verified, so it is dropped rather than trusted.
@@ -702,21 +967,45 @@ def claim() -> None:
     leave two voices talking over each other.
     """
     stop()
-    PIDFILE.write_text(f"{os.getpid()} {process_start(os.getpid()) or ''}".strip())
+    PIDFILE.write_text(f"{os.getpid()} {process_start(os.getpid()) or '-'} {_session or '-'}")
     signal.signal(signal.SIGTERM, _on_term)
     _sweep_parts()
 
 
 def release() -> None:
-    """Hand back the pidfile if it is still ours, and take our audio with us."""
+    """Hand back the pidfile if it is still ours, and take our scratch files with us."""
     rec = read_pidfile()
     if rec and rec[0] == os.getpid():
         PIDFILE.unlink(missing_ok=True)
-    for part in PARTS:
+    for part in (*PARTS, JOB):
         try:
             part.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def mark_own_turn(session: str) -> None:
+    """Note that the current turn of `session` is one of this plugin's commands.
+
+    Its reply ("🔇 stopped", "auto-read on") is not something to read aloud,
+    and reading it would also cut off the reading /speak just started. The
+    Stop hook of the same turn finds this note and skips that one reply.
+    """
+    try:
+        (pathlib.Path(tempfile.gettempdir()) / f"claude-read-aloud-quiet-{session}").touch()
+    except OSError:
+        pass
+
+
+def is_own_turn(session: str) -> bool:
+    """Consume the note mark_own_turn() left, if any (and not a stale one)."""
+    p = pathlib.Path(tempfile.gettempdir()) / f"claude-read-aloud-quiet-{session}"
+    try:
+        fresh = time.time() - p.stat().st_mtime < 600
+        p.unlink()
+        return fresh
+    except OSError:
+        return False
 
 
 def _on_term(_sig=None, _frm=None):
@@ -729,64 +1018,142 @@ def _on_term(_sig=None, _frm=None):
 
 
 def _sweep_parts() -> None:
-    """Bin scratch audio a crashed reading left behind — an hour is long past."""
+    """Bin scratch files a crashed reading left behind — an hour is long past."""
     cutoff = time.time() - 3600
     try:
-        for part in pathlib.Path(tempfile.gettempdir()).glob(PART_GLOB):
-            if part.stat().st_mtime < cutoff:
-                part.unlink(missing_ok=True)
+        for pattern in SCRATCH_GLOBS:
+            for part in pathlib.Path(tempfile.gettempdir()).glob(pattern):
+                if part.stat().st_mtime < cutoff:
+                    part.unlink(missing_ok=True)
     except OSError:
         pass
 
 
-def play_chunked(text: str, cfg: dict, synth) -> None:
-    """Gapless chunked playback: synthesise chunk i+1 while chunk i plays."""
-    global _player
+def play_chunked(text: str, cfg: dict, synth, own_langs: set[str] | None = None) -> None:
+    """Gapless chunked playback: synthesise the next chunk while one plays.
+
+    own_langs: the languages synth can voice (None: all of them). Runs in any
+    other language are read by the system voice for that language: Kokoro has
+    no Russian voice, the system usually does.
+    """
     claim()                                      # never overlap two readings
     try:
-        chunks = chunk_text(text, int(cfg["first_chars"]), int(cfg["chunk_chars"]))
-        synth(chunks[0], PARTS[0])
-        for i in range(len(chunks)):
-            cmd, env = player_cmd(PARTS[i % 2])
-            _player = subprocess.Popen(
-                cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                **quiet_win())
-            prefetch = None
-            if i + 1 < len(chunks):
-                prefetch = threading.Thread(
-                    target=synth, args=(chunks[i + 1], PARTS[(i + 1) % 2]), daemon=True)
-                prefetch.start()
-            _player.wait()
-            if prefetch:
-                prefetch.join()
+        first, full = int(cfg["first_chars"]), int(cfg["chunk_chars"])
+        if own_langs is None:
+            chunks = [("", c) for c in chunk_text(text, first, full)]
+        else:
+            chunks = [(lang, c) for lang, run in segments(text)
+                      for c in chunk_text(run, first, full)]
+        own = [i for i, (lang, _) in enumerate(chunks) if own_langs is None or lang in own_langs]
+        # Own chunks alternate between the two scratch files, so the one being
+        # written is never the one being played.
+        slot = {i: PARTS[k % 2] for k, i in enumerate(own)}
+
+        def render(i: int) -> None:
+            # Delete first: if synthesis fails, nothing stale is left to play
+            # (the file still held the chunk from two steps back).
+            slot[i].unlink(missing_ok=True)
+            synth(chunks[i][1], slot[i])
+
+        def prefetch(i: int | None):
+            if i is None:
+                return None
+            errors: list[Exception] = []
+
+            def work():
+                try:
+                    render(i)
+                except Exception as e:           # noqa: BLE001 — reported below
+                    errors.append(e)
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            return t, errors
+
+        after = lambda i: next((j for j in own if j > i), None)
+        ahead = prefetch(own[0] if own else None)
+        for i, (lang, chunk) in enumerate(chunks):
+            if i not in slot:
+                run_players(system_speech([(lang, chunk)], cfg))
+                continue
+            thread, errors = ahead
+            thread.join()
+            if errors:                           # one retry; a second failure ends it
+                log(f"chunk {i + 1} of {len(chunks)} failed ({errors[0]}), retrying")
+                render(i)
+            ahead = prefetch(after(i))
+            run_players([player_cmd(slot[i])])
     finally:
         release()                                # a failed request must not strand it
 
 # --------------------------------------------------------------------------- modes
 
 
-def detach(argv: list[str]) -> None:
-    """Re-launch this script detached so the caller returns immediately."""
-    kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-                    "stdin": subprocess.DEVNULL}
+def detach(argv: list[str]) -> subprocess.Popen:
+    """Re-launch this script detached so the caller returns immediately.
+
+    Nobody watches a detached reading, so its stderr goes to the log: a wrong
+    key or a missing voice is then findable instead of plain silence.
+    """
+    kwargs: dict = {"stdout": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
+    try:
+        log_path().parent.mkdir(parents=True, exist_ok=True)
+        kwargs["stderr"] = open(log_path(), "a", encoding="utf-8")
+    except OSError:
+        kwargs["stderr"] = subprocess.DEVNULL
     if IS_WIN:
         kwargs["creationflags"] = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), *argv], **kwargs)
+    return subprocess.Popen([sys.executable, os.path.abspath(__file__), *argv], **kwargs)
+
+
+def handoff(text: str) -> str:
+    """Put text in a scratch file for a detached reader (--text-file), which
+    deletes it. A command line is too short for a long reply, and on Windows
+    it is re-quoted on the way through."""
+    fd, path = tempfile.mkstemp(prefix="claude-read-aloud-handoff-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+# The plugin's own commands, typed as /read-aloud:speak or, when unambiguous, /speak.
+OWN_COMMANDS = ("speak", "speak-stop", "speak-auto", "speak-status", "voice", "voice-setup")
 
 
 def hook_mode() -> int:
-    """Stop-hook entry: exit fast and NEVER fail — Claude's flow comes first."""
+    """Hook entry: exit fast and NEVER fail — Claude's flow comes first.
+
+    Stop: read the reply just finished, if auto-read is on. The text comes
+    from the hook input (last_assistant_message), not the transcript file,
+    which Claude Code writes asynchronously and can still hold the previous
+    reply.
+    UserPromptSubmit: a new prompt stops that session's reading.
+    """
     try:
         event = json.loads(sys.stdin.read() or "{}")
-        if not load_config().get("auto_read"):
+        cfg = load_config()
+        session = valid_session(event.get("session_id"))
+        if event.get("hook_event_name") == "UserPromptSubmit":
+            word = str(event.get("prompt") or "").strip().split(" ", 1)[0]
+            own = word.startswith("/read-aloud:") or word.lstrip("/") in OWN_COMMANDS
+            if session and cfg.get("stop_on_prompt", True) and not own:
+                stop(only_session=session)
             return 0
-        path = event.get("transcript_path", "")
+        if session and is_own_turn(session):
+            return 0
+        if not cfg.get("auto_read"):
+            return 0
+        extra = ["--session", session] if session else []
+        text = event.get("last_assistant_message")
+        if isinstance(text, str) and text.strip():
+            detach(["--text-file", handoff(text), *extra])
+            return 0
+        path = event.get("transcript_path", "")    # older Claude Code
         if path and pathlib.Path(path).exists():
-            detach(["--transcript", path])
+            detach(["--transcript", path, *extra])
     except Exception as e:                        # noqa: BLE001 — deliberate
-        print(f"read-aloud hook: {e}", file=sys.stderr)
+        log(f"hook: {e}")
     return 0
 
 
@@ -885,16 +1252,21 @@ def list_voices(cfg: dict) -> int:
                 m = re.match(r"^(.*?)\s{2,}([a-z]{2}_\w+)", line)
                 if m:
                     voices.append({"id": m.group(1).strip(),
-                                   "label": f"{m.group(1).strip()} ({m.group(2)})"})
+                                   "label": f"{m.group(1).strip()} ({m.group(2)})",
+                                   "lang": m.group(2)[:2]})
         elif IS_WIN:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "Add-Type -AssemblyName System.Speech;"
                  "(New-Object System.Speech.Synthesis.SpeechSynthesizer)"
-                 ".GetInstalledVoices()|ForEach-Object{$_.VoiceInfo.Name}"],
+                 ".GetInstalledVoices()|ForEach-Object{"
+                 "$_.VoiceInfo.Name + '|' + $_.VoiceInfo.Culture.Name}"],
                 capture_output=True, text=True).stdout
-            voices = [{"id": n.strip(), "label": n.strip()}
-                      for n in out.splitlines() if n.strip()]
+            for line in out.splitlines():
+                name, _, culture = line.strip().partition("|")
+                if name:
+                    voices.append({"id": name, "label": f"{name} ({culture})",
+                                   "lang": culture.split("-")[0]})
         else:
             out = subprocess.run(["spd-say", "-L"], capture_output=True,
                                  text=True).stdout
@@ -902,11 +1274,13 @@ def list_voices(cfg: dict) -> int:
                 # Rows are "NAME LANGUAGE VARIANT" but NAME can contain spaces
                 # ("English (Great Britain)+Adam en-gb Adam"), so split from
                 # the right. spd-say lists every variant in every language —
-                # ~15,000 rows; English only, or the picker is unusable.
+                # ~15,000 rows; the two languages read here only, or the
+                # picker is unusable.
                 parts = line.rsplit(None, 2)
-                if len(parts) == 3 and parts[1].lower().startswith("en"):
+                if len(parts) == 3 and parts[1].lower()[:2] in ("en", "ru"):
                     voices.append({"id": parts[0].strip(),
-                                   "label": parts[0].strip()})
+                                   "label": f"{parts[0].strip()} ({parts[1]})",
+                                   "lang": parts[1].lower()[:2]})
     else:
         print(f"provider {provider} has no listable voices", file=sys.stderr)
         return 1
@@ -922,8 +1296,21 @@ def show_status(cfg: dict) -> None:
     print(f"config    : {config_path()}")
     print(f"provider  : {cfg['provider']}"
           + (f"  (voice: {cfg['voice']})" if cfg["voice"] else "  (default voice)"))
+    per_lang = cfg.get("voices") or {}
+    print(f"voices    : " + "  ".join(f"{lang}: {per_lang.get(lang) or 'auto'}"
+                                      for lang in ("ru", "en"))
+          + "   (system voice per language)")
     print(f"speed     : {cfg['speed']}")
     print(f"auto_read : {'on — every reply is spoken' if cfg['auto_read'] else 'off'}")
+    print(f"new prompt: {'stops the reading' if cfg.get('stop_on_prompt', True) else 'reading continues'}"
+          f"  (stop_on_prompt)")
+    err = last_error()
+    if err:
+        age = err[1]
+        when = (f"{int(age // 60)} min ago" if age < 3600 else
+                f"{int(age // 3600)} h ago" if age < 86400 else f"{int(age // 86400)} days ago")
+        print(f"last error: ({when}) {err[0]}")
+        print(f"log       : {log_path()}")
     print(f"api keys  : " + "  ".join(f"{p}:{s}" for p, s in keys.items()))
     if "config" in keys.values():
         print("warning   : API keys are stored in plain text in the config file. "
@@ -961,7 +1348,33 @@ def main() -> int:
                     help="print effective config as JSON (for UI panels)")
     ap.add_argument("--auto", choices=["on", "off"])
     ap.add_argument("--print", action="store_true", dest="print_only")
+    ap.add_argument("--session", default="",
+                    help="Claude Code session id: read its transcript, tag the reading")
+    ap.add_argument("--turn", default="",
+                    help="like --session, and this run is part of a slash-command "
+                         "turn whose own reply must not be read aloud")
+    ap.add_argument("--previous", action="store_true",
+                    help="read the reply before the latest prompt")
+    ap.add_argument("--text-file", dest="text_file",
+                    help="speak the text in this file, then delete it")
+    ap.add_argument("--lang", choices=["ru", "en"],
+                    help="with --set-voice: the language that voice is for")
     args = ap.parse_args()
+
+    # Windows consoles default to a legacy code page that cannot print emoji
+    # (or, piped, mangles Cyrillic for whoever reads it). Never crash on output.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace",
+                               **({} if stream.isatty() else {"encoding": "utf-8"}))
+        except (AttributeError, ValueError):
+            pass
+
+    global _session
+    turn = valid_session(args.turn)
+    if turn:
+        mark_own_turn(turn)
+    _session = valid_session(args.session) or turn
 
     if args.hook:
         return hook_mode()
@@ -1001,6 +1414,16 @@ def main() -> int:
         return 0
     if args.list_voices:
         return list_voices(cfg)
+    if args.set_voice and args.lang:
+        per_lang = dict(cfg.get("voices") or {})
+        if args.set_voice == "auto":
+            per_lang.pop(args.lang, None)
+        else:
+            per_lang[args.lang] = args.set_voice
+        cfg["voices"] = per_lang
+        save_config(cfg)
+        print(f"{args.lang} voice set to {args.set_voice}")
+        return 0
     if args.set_voice:
         cfg["voice"] = args.set_voice
         save_config(cfg)
@@ -1008,6 +1431,7 @@ def main() -> int:
         return 0
     if args.voice:
         cfg["voice"] = args.voice          # this run only; nothing saved
+        cfg["voices"] = {}                 # an audition must not be overridden
     if args.status:
         show_status(cfg)
         return 0
@@ -1018,8 +1442,18 @@ def main() -> int:
         return 0
 
     if args.detach:
-        argv = [a for a in sys.argv[1:] if a != "--detach"]
-        detach(argv)
+        # The reader runs on alone: it is no longer part of the command's turn.
+        argv = ["--session" if a == "--turn" else a for a in sys.argv[1:] if a != "--detach"]
+        reader = detach(argv)
+        try:                                     # most failures show up at once
+            code = reader.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            code = None
+        if code:
+            err = last_error()
+            print(f"error: {err[0] if err else f'reader exited with code {code}'}")
+            print(f"log: {log_path()}")
+            return 1
         print("reading aloud…")
         # First impressions: the stock Linux voice is espeak, and it is rough.
         # Tell the user the good free voice is one command away — once there.
@@ -1034,21 +1468,24 @@ def main() -> int:
         raw = sys.stdin.read()
     elif args.text:
         raw = args.text
+    elif args.text_file:
+        f = pathlib.Path(args.text_file)
+        raw = f.read_text(encoding="utf-8")
+        f.unlink(missing_ok=True)
     else:
         t = (pathlib.Path(args.transcript) if args.transcript
-             else newest_transcript(args.project))
+             else find_transcript(_session, args.project))
         if not t or not t.exists():
             print("no transcript found", file=sys.stderr)
             return 1
-        raw = last_reply(t)
+        raw = last_reply(t, previous=args.previous)
 
     text = spoken_form(raw, int(cfg["max_chars"]))
     if not text:
         print("nothing to speak", file=sys.stderr)
         return 1
     if args.print_only:
-        print(text)
-        return 0
+        return print_plan(text, cfg)
 
     # Claimed before the engine is built, not after: loading a 300MB model or
     # waiting on a cloud voice is exactly the window a second click lands in.
@@ -1058,9 +1495,30 @@ def main() -> int:
         if synth is None:
             speak_direct(text, cfg)
         else:
-            play_chunked(text, cfg, synth)
+            # Kokoro has no Russian voice; cloud voices are multilingual.
+            play_chunked(text, cfg, synth, {"en"} if cfg["provider"] == "kokoro" else None)
     finally:
         release()                                # e.g. a missing API key exits here
+    return 0
+
+
+def print_plan(text: str, cfg: dict) -> int:
+    """--print: what would be read, run by run, and by which voice."""
+    runs = segments(text)
+    if cfg["provider"] == "system" and IS_WIN:
+        (cmd, env), = system_speech(runs, cfg)
+        env["CRA_DRY"] = "1"
+        try:
+            out = subprocess.run(cmd, env=env, capture_output=True, **quiet_win())
+        finally:
+            JOB.unlink(missing_ok=True)
+        for line in out.stdout.decode("utf-8", "replace").splitlines():
+            voice, _, run = line.partition("\t")
+            print(f"[{voice or 'default voice'}] {run}")
+        return out.returncode
+    for lang, run in runs:
+        voice = mac_voice_for(lang, cfg) if cfg["provider"] == "system" and IS_MAC else ""
+        print(f"[{voice or lang}] {run}")
     return 0
 
 
