@@ -36,7 +36,7 @@ import sys
 
 PORT = 48777
 SERVER = f"http://127.0.0.1:{PORT}"
-MARKER = "/* claude-read-aloud composer v2 */"
+MARKER = "/* claude-read-aloud composer v3 */"
 # Any version of our own injection. The version in MARKER is what tells an
 # upgrade that the button in the file is the OLD one and has to go: appending a
 # second would leave two buttons, each with its own idea of what is playing.
@@ -155,7 +155,7 @@ INJECTION = MARKER + """
       return;
     }
     playing().then(function (on) {
-      if (on) { paint(b, false); ask('/stop').catch(function () {}); return; }
+      if (on) { paint(b, false); ask('/stop', '').catch(function () {}); return; }
       var reply = lastReplyText(b);
       if (!reply) {
         // Nothing here to read. The old button fell back to "the newest

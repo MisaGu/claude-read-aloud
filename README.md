@@ -39,8 +39,10 @@ claude plugin install read-aloud@claude-read-aloud
 `/plugin install …`, or from a local clone by passing its path to
 `marketplace add`.)
 
-Requires Python 3.9+ on your PATH (`python3`, or `python` on Windows).
-No packages to install — the whole engine is one standard-library script.
+Requires Python 3.9+ on your PATH as `python3`, `python` or `py` (the first
+one that actually runs is used, so Windows' Microsoft Store `python3` stub is
+skipped). No packages to install — the whole engine is one standard-library
+script.
 
 ## Use
 
@@ -49,8 +51,13 @@ No packages to install — the whole engine is one standard-library script.
 | `/read-aloud:speak` | read the last reply aloud |
 | `/read-aloud:speak-stop` | stop |
 | `/read-aloud:speak-auto on` | read **every** reply automatically (off by default) |
-| `/read-aloud:speak-status` | show provider, voice, and where the config lives |
+| `/read-aloud:speak-status` | show provider, voices, auto-read, and the last error |
+| `/read-aloud:voice` | list, audition and pick voices, one per language |
 | `/read-aloud:voice-setup` | one-time install of the free Kokoro neural voice |
+
+The commands are yours to type: Claude never runs them on its own. What they
+reply ("🔊 reading aloud", "🔇 stopped") is never read aloud, and `/speak`
+always reads the reply *before* the command, from the session you typed it in.
 
 **On Linux, run `/read-aloud:voice-setup` first.** macOS and Windows system
 voices are decent out of the box; Linux's stock voice is espeak, which is not.
@@ -64,6 +71,25 @@ Long replies start speaking in ~1–3 seconds regardless of length: text is
 split at sentence boundaries into ramped chunks (small first — its size *is*
 the time-to-first-sound), and each next chunk synthesises while the previous
 one plays, so there are no gaps.
+
+## Russian and English in one reply
+
+A reply that mixes languages is split into runs by alphabet, and each run is
+read by a voice of its own language — with the `system` provider, a Russian
+voice for Cyrillic and an English one for the rest. Nothing to configure if
+a voice of each language is installed (Windows: *Settings → Time & language →
+Speech → Add voices*; only voices listed by `/read-aloud:voice` can be used).
+To choose them yourself:
+
+```
+speak.py --set-voice "Microsoft Irina Desktop" --lang ru
+speak.py --set-voice "Microsoft David Desktop" --lang en
+speak.py --print --text "Готово. The fix is ready."   # shows who reads what
+```
+
+Kokoro has no Russian voice, so under `kokoro` the Russian runs are read by
+the system's Russian voice. Cloud voices are multilingual and read everything
+themselves.
 
 ## Voices
 
@@ -83,8 +109,10 @@ Config lives at `~/.config/claude-read-aloud/config.json`
 {
   "provider": "speechify",
   "voice": "oliver",
+  "voices": {"ru": "Microsoft Irina Desktop"},
   "speed": 1.0,
-  "auto_read": false
+  "auto_read": false,
+  "stop_on_prompt": true
 }
 ```
 
@@ -108,9 +136,17 @@ play (that's what enables gapless chunking):
 - **Auto-read is off by default, on purpose.** A working session produces hours
   of speech per day (we measured 4+). Try `/speak-auto on` — most people come
   back to on-demand within a day, and that's the intended workflow.
+- **Sending your next prompt stops the reading** of that session's reply
+  (other sessions keep talking). Set `"stop_on_prompt": false` to let it finish.
 - **Replies cap at 12,000 characters** (~14 minutes) and say so when cut.
   Code blocks are spoken as "code omitted" — nobody wants JSON read aloud.
+  Tables are read row by row, headings and list items get a pause, emoji are
+  skipped.
 - **Stop always works mid-sentence**: `/speak-stop`, or the button/hotkey below.
+- **Silence has a reason on file.** A reading that fails writes why to
+  `read-aloud.log` (`%LOCALAPPDATA%\claude-read-aloud\` on Windows,
+  `~/.local/share/claude-read-aloud/` elsewhere); `/speak` reports it right
+  away and `/read-aloud:speak-status` shows the last one.
 - Speechify's WAV arrives with broken (streaming) header sizes; the plugin
   repairs them — if you ever hear a burst of static with another tool, that's
   what it was.
@@ -186,7 +222,9 @@ the installed Claude Code extension* on your machine:
   `connect-src http://127.0.0.1:48777`, so the button can reach this
   extension's local server. That is a real, if small, widening of the webview
   sandbox — one localhost port — and it's the entire reason this is opt-in
-  rather than default.
+  rather than default. The server answers only requests from a VS Code webview
+  (checked by `Origin` and `Host`), so a web page open in your browser cannot
+  use it to make your machine speak.
 
 Originals are backed up beside each file (`*.cra-orig`) and restored exactly on
 removal. **Every Claude Code update wipes the patch**; the extension notices on
@@ -203,10 +241,35 @@ voice to a feature request on
 
 ## How it decides what to read
 
-- `/speak` and auto-read use the session's own transcript (hooks receive the
-  exact path — never a guess).
+- Auto-read speaks the reply text Claude Code hands the Stop hook — never a
+  transcript that may still be catching up.
+- `/speak` reads its own session's transcript (the command passes the session
+  id), and the reply before the command, not the command's own turn.
 - The VS Code button scopes to the window's workspace, so a busier session in
   another project can't hijack what gets read.
+
+## Privacy and security
+
+- **What leaves your machine:** nothing with the `system` and `kokoro`
+  providers. With `speechify`, `elevenlabs` or `openai`, the text of each
+  reply is sent to that company to be voiced; `--status` says so.
+- **Reply text is treated as data, never as code.** A reply can carry text
+  that Claude picked up from a web page or a file, so it is never pasted into
+  a command line. On Windows the system voice reads it from a UTF-8 job
+  file whose path arrives in an environment variable. A `command` engine receives `{text}` as a single
+  argument with no shell, and `.bat`/`.cmd` engines are refused on Windows,
+  because cmd.exe would re-parse the reply.
+- **Stop kills only the reader it started.** The pidfile records the reader's
+  start time next to its pid, so a crash that leaves a stale pidfile cannot
+  make Stop kill an unrelated program that reused the pid. On Windows, Stop
+  ends the player too.
+- **Kokoro setup is pinned:** exact package versions installed from wheels
+  only, and SHA-256-checked model files.
+- **API keys:** prefer environment variables. Keys kept under `api_keys` in the
+  config file are plain text; `--status` warns about them, and on macOS and
+  Linux the file is saved owner-only.
+
+Tests: `python -m unittest discover -s tests`
 
 ## License
 

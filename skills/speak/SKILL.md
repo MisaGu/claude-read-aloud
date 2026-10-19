@@ -1,12 +1,14 @@
 ---
 description: Read Claude's last reply aloud
+disable-model-invocation: true
 ---
 
-Run exactly this one bash command, then reply with "🔊 reading aloud" —
-plus, if the command printed a line starting with "note:", relay that line too:
+Run exactly this one bash command:
 
 ```
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/speak.py" --detach --project "$(pwd)"
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/speak.sh" --detach --previous --turn "${CLAUDE_SESSION_ID}" --project "${CLAUDE_PROJECT_DIR}"
 ```
 
-If `python3` is not found, retry the same command with `python`.
+If it printed a line starting with "error:", show that line (and the "log:"
+line) to the user and nothing else. Otherwise reply with only "🔊 reading
+aloud", plus any line starting with "note:".

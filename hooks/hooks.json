@@ -5,8 +5,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" --hook || python \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" --hook",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.sh\" --hook",
             "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.sh\" --hook",
+            "timeout": 15,
+            "async": true
           }
         ]
       }
