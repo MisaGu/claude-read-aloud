@@ -1107,6 +1107,13 @@ def detach(argv: list[str]) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, os.path.abspath(__file__), *argv], **kwargs)
 
 
+def read_stdin() -> str:
+    """Stdin as UTF-8, which is what Claude Code and the VS Code extension send.
+    Text-mode stdin would use the Windows code page (cp1251…) and turn every
+    Cyrillic reply into surrogates that cannot be written back out."""
+    return sys.stdin.buffer.read().decode("utf-8", "replace")
+
+
 def handoff(text: str) -> str:
     """Put text in a scratch file for a detached reader (--text-file), which
     deletes it. A command line is too short for a long reply, and on Windows
@@ -1131,7 +1138,7 @@ def hook_mode() -> int:
     UserPromptSubmit: a new prompt stops that session's reading.
     """
     try:
-        event = json.loads(sys.stdin.read() or "{}")
+        event = json.loads(read_stdin() or "{}")
         cfg = load_config()
         session = valid_session(event.get("session_id"))
         if event.get("hook_event_name") == "UserPromptSubmit":
@@ -1465,7 +1472,7 @@ def main() -> int:
         return 0
 
     if args.stdin:
-        raw = sys.stdin.read()
+        raw = read_stdin()
     elif args.text:
         raw = args.text
     elif args.text_file:

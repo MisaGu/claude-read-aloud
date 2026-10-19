@@ -359,13 +359,18 @@ class Transcripts(Scratch):
 # -------------------------------------------------------------------- hooks
 
 
+def utf8_stdin(text):
+    """Stdin as Claude Code gives it: UTF-8 bytes."""
+    return io.TextIOWrapper(io.BytesIO(text.encode("utf-8")), encoding="utf-8")
+
+
 class Hooks(Scratch):
     def hook(self, event, auto_read=True):
         launched = []
         cfg = dict(speak.DEFAULTS, auto_read=auto_read)
         with mock.patch.object(speak, "detach", lambda argv: launched.append(argv)), \
                 mock.patch.object(speak, "load_config", lambda: cfg), \
-                mock.patch.object(speak.sys, "stdin", io.StringIO(json.dumps(event))):
+                mock.patch.object(speak.sys, "stdin", utf8_stdin(json.dumps(event))):
             self.assertEqual(speak.hook_mode(), 0)
         return launched
 
@@ -401,7 +406,7 @@ class Hooks(Scratch):
         self.assertEqual(calls, ["s3"])
 
     def test_garbage_input_never_fails(self):
-        with mock.patch.object(speak.sys, "stdin", io.StringIO("not json")):
+        with mock.patch.object(speak.sys, "stdin", utf8_stdin("not json")):
             self.assertEqual(speak.hook_mode(), 0)
 
 
@@ -409,17 +414,25 @@ class Hooks(Scratch):
 
 
 class CommandLine(unittest.TestCase):
-    def run_script(self, *args):
+    def run_script(self, *args, stdin=b""):
         with tempfile.TemporaryDirectory() as home:
-            env = dict(os.environ, LOCALAPPDATA=home, APPDATA=home, XDG_DATA_HOME=home,
+            # No PYTHONIOENCODING / PYTHONUTF8: the hook runs with the system defaults.
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+            env.update(LOCALAPPDATA=home, APPDATA=home, XDG_DATA_HOME=home,
                        XDG_CONFIG_HOME=home)
             return subprocess.run([sys.executable, str(SCRIPT), *args], env=env,
-                                  capture_output=True, timeout=60)
+                                  input=stdin, capture_output=True, timeout=60)
 
     def test_print_with_emoji_does_not_crash(self):
         out = self.run_script("--print", "--text", "🔊 Готово! Done.")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("Готово", out.stdout.decode("utf-8"))
+
+    def test_russian_on_stdin_survives_the_windows_code_page(self):
+        out = self.run_script("--stdin", "--print", stdin="Привет, проверка — ёжик.".encode("utf-8"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Привет, проверка — ёжик.", out.stdout.decode("utf-8"))
 
     def test_detach_reports_a_reader_that_fails(self):
         out = self.run_script("--detach", "--transcript", "does-not-exist.jsonl")
